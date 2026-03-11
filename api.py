@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -40,7 +41,7 @@ def _cache_set(key: str, value: str):
 # ---------------------------------------------------------------------------
 # MCP client helpers  (uses FastMCP's own Python client over its protocol)
 # ---------------------------------------------------------------------------
-MCP_URL = "http://127.0.0.1:8001/mcp"
+MCP_URL = os.environ.get("MCP_URL", "http://127.0.0.1:8001/mcp")
 
 _mcp_tools_cache: list[types.Tool] | None = None
 

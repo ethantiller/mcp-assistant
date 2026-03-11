@@ -1,3 +1,4 @@
+import os
 from fastmcp import FastMCP
 from datetime import datetime
 import math
@@ -134,4 +135,5 @@ def fetch_url_content(url: str) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="127.0.0.1", port=8001)
+    host = os.environ.get("MCP_HOST", "127.0.0.1")
+    mcp.run(transport="streamable-http", host=host, port=8001)
