@@ -13,12 +13,22 @@ export interface ToolCall {
   result: string;
 }
 
+export interface UploadedFile {
+  id: string;
+  chat_id: string;
+  original_name: string;
+  mime_type: string;
+  size: number;
+  created_at: string;
+}
+
 export interface Message {
   id: string;
   chat_id: string;
   role: "user" | "assistant";
   content: string;
   tool_calls?: ToolCall[] | null;
+  files?: UploadedFile[];
   created_at: string;
 }
 
@@ -58,9 +68,17 @@ export const api = {
   deleteChat: (id: string) =>
     request<{ ok: boolean }>(`/chats/${id}`, { method: "DELETE" }),
 
-  sendMessage: (chatId: string, message: string) =>
+  sendMessage: (chatId: string, message: string, fileIds: string[] = []) =>
     request<{ reply: string; tool_calls: ToolCall[] }>(`/chats/${chatId}/messages`, {
       method: "POST",
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, file_ids: fileIds }),
     }),
+
+  uploadFile: async (chatId: string, file: File): Promise<UploadedFile> => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const res = await fetch(`${BASE}/chats/${chatId}/files`, { method: "POST", body: fd });
+    if (!res.ok) throw new Error(await res.text());
+    return res.json() as Promise<UploadedFile>;
+  },
 };

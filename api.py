@@ -1,17 +1,23 @@
 import hashlib
 import json
 import os
+import re
+import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastmcp import Client as MCPClient
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
 import database as db
+
+UPLOAD_DIR = Path(__file__).parent / "uploads"
 
 load_dotenv()
 
@@ -119,12 +125,13 @@ MODEL = "gemini-2.5-flash"
 
 
 async def chat_with_gemini(
-    history: list[dict], user_message: str
+    history: list[dict], user_message: str, files: list[dict] | None = None
 ) -> tuple[str, list[dict]]:
     """
     Send the full conversation history + new user message to Gemini,
     handle tool calls via MCP, and return (reply_text, tool_calls).
     tool_calls is a list of {"name", "args", "result"} dicts.
+    files is an optional list of file metadata dicts from the DB.
     """
     tools = await fetch_mcp_tools()
 
@@ -134,11 +141,16 @@ async def chat_with_gemini(
         role = "user" if msg["role"] == "user" else "model"
         contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
 
-    contents.append(types.Content(role="user", parts=[types.Part(text=user_message)]))
+    # Build parts for the current user message, including any attached files
+    user_parts: list[types.Part] = [types.Part(text=user_message)]
+    for f in (files or []):
+        data = Path(f["stored_path"]).read_bytes()
+        user_parts.append(types.Part.from_bytes(data=data, mime_type=f["mime_type"]))
+    contents.append(types.Content(role="user", parts=user_parts))
 
     cache_key = _cache_key(MODEL, [{"role": c.role, "text": c.parts[0].text} for c in contents])
     cached = _cache_get(cache_key)
-    if cached:
+    if cached and not files:
         return cached, []
 
     # Agentic loop: keep calling until no more tool calls
@@ -191,6 +203,7 @@ async def chat_with_gemini(
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    UPLOAD_DIR.mkdir(exist_ok=True)
     db.init_db()
     # Pre-warm MCP tool list (best effort)
     try:
@@ -214,6 +227,7 @@ app.add_middleware(
 
 class SendMessageRequest(BaseModel):
     message: str
+    file_ids: list[str] = []
 
 
 class CreateChatRequest(BaseModel):
@@ -257,20 +271,58 @@ def delete_chat(chat_id: str):
     return {"ok": True}
 
 
+@app.post("/chats/{chat_id}/files")
+async def upload_file(chat_id: str, file: UploadFile):
+    chat = db.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(404, "Chat not found")
+
+    # Sanitize filename: keep only safe characters
+    safe_name = re.sub(r"[^\w.\-]", "_", file.filename or "upload")
+    stored_name = f"{uuid.uuid4()}_{safe_name}"
+    stored_path = UPLOAD_DIR / stored_name
+
+    contents = await file.read()
+    stored_path.write_bytes(contents)
+
+    record = db.save_file(
+        chat_id=chat_id,
+        original_name=file.filename or "upload",
+        stored_path=str(stored_path),
+        mime_type=file.content_type or "application/octet-stream",
+        size=len(contents),
+    )
+    return record
+
+
+@app.get("/files/{file_id}")
+def serve_file(file_id: str):
+    record = db.get_file(file_id)
+    if not record:
+        raise HTTPException(404, "File not found")
+    path = Path(record["stored_path"])
+    if not path.exists():
+        raise HTTPException(404, "File not found on disk")
+    return FileResponse(path, media_type=record["mime_type"], filename=record["original_name"])
+
+
 @app.post("/chats/{chat_id}/messages")
 async def send_message(chat_id: str, req: SendMessageRequest):
     chat = db.get_chat(chat_id)
     if not chat:
         raise HTTPException(404, "Chat not found")
 
-    # Persist user message
-    db.add_message(chat_id, "user", req.message)
+    # Load file metadata for any attached files
+    attached_files = db.get_files_by_ids(req.file_ids) if req.file_ids else []
+
+    # Persist user message with file references
+    db.add_message(chat_id, "user", req.message, file_ids=req.file_ids or None)
 
     # Retrieve full history (excluding the message we just added for context building)
     history = db.get_messages(chat_id)[:-1]  # everything before the new message
 
     try:
-        reply, tool_calls = await chat_with_gemini(history, req.message)
+        reply, tool_calls = await chat_with_gemini(history, req.message, files=attached_files)
     except Exception as e:
         raise HTTPException(500, f"Model error: {e}") from e
 
