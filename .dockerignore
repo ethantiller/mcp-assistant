@@ -1,0 +1,10 @@
+.git
+.claude
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.env
+.venv
+chats.db
+frontend/node_modules
+**/*.log
