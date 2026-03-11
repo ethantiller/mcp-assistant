@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { Chat, Message, ToolCall } from "./api";
+import type { Chat, Message, ToolCall, UploadedFile } from "./api";
 import "./App.css";
 
 // ── small helpers ──────────────────────────────────────────────────────────
@@ -168,8 +168,29 @@ function Sidebar({
 
 // ── MessageBubble ──────────────────────────────────────────────────────────
 
+function FileAttachment({ file }: { file: UploadedFile }) {
+  const isImage = file.mime_type.startsWith("image/");
+  const url = `http://localhost:8000/files/${file.id}`;
+  return (
+    <a className="file-attachment" href={url} target="_blank" rel="noreferrer">
+      {isImage ? (
+        <img src={url} alt={file.original_name} className="file-thumb" />
+      ) : (
+        <span className="file-icon">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
+            <polyline points="14 2 14 8 20 8" />
+          </svg>
+        </span>
+      )}
+      <span className="file-name">{file.original_name}</span>
+    </a>
+  );
+}
+
 function MessageBubble({ msg }: { msg: Message }) {
   const hasTools = msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0;
+  const hasFiles = msg.files && msg.files.length > 0;
   return (
     <div className={`bubble-wrap ${msg.role}`}>
       <div className={`bubble ${msg.role}`}>
@@ -178,6 +199,11 @@ function MessageBubble({ msg }: { msg: Message }) {
             {msg.tool_calls!.map((tc, i) => (
               <ToolCallBlock key={i} call={tc} />
             ))}
+          </div>
+        )}
+        {hasFiles && (
+          <div className="file-attachments">
+            {msg.files!.map((f) => <FileAttachment key={f.id} file={f} />)}
           </div>
         )}
         <div className="bubble-content">{renderContent(msg.content)}</div>
@@ -195,8 +221,11 @@ export default function App() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pendingFiles, setPendingFiles] = useState<UploadedFile[]>([]);
+  const [uploading, setUploading] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     api.listChats().then(setChats).catch(console.error);
@@ -232,9 +261,9 @@ export default function App() {
     } catch (e: unknown) { setError((e as Error).message); }
   };
 
-  const handleSend = async () => {
-    const text = input.trim();
-    if (!text || sending) return;
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
     setError(null);
 
     let chatId = activeChatId;
@@ -247,17 +276,47 @@ export default function App() {
       } catch (e: unknown) { setError((e as Error).message); return; }
     }
 
+    setUploading(true);
+    try {
+      const uploaded = await Promise.all(files.map((f) => api.uploadFile(chatId!, f)));
+      setPendingFiles((prev) => [...prev, ...uploaded]);
+    } catch (e: unknown) {
+      setError((e as Error).message);
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const handleSend = async () => {
+    const text = input.trim();
+    if ((!text && pendingFiles.length === 0) || sending) return;
+    setError(null);
+
+    let chatId = activeChatId;
+    if (!chatId) {
+      try {
+        const chat = await api.createChat();
+        setChats((prev) => [chat, ...prev]);
+        chatId = chat.id;
+        setActiveChatId(chat.id);
+      } catch (e: unknown) { setError((e as Error).message); return; }
+    }
+
+    const fileIds = pendingFiles.map((f) => f.id);
+    const filesToAttach = [...pendingFiles];
     const optimistic: Message = {
       id: "tmp-" + Date.now(), chat_id: chatId, role: "user",
-      content: text, created_at: new Date().toISOString(),
+      content: text || " ", files: filesToAttach, created_at: new Date().toISOString(),
     };
     setMessages((prev) => [...prev, optimistic]);
     setInput("");
+    setPendingFiles([]);
     setSending(true);
     if (textareaRef.current) textareaRef.current.style.height = "auto";
 
     try {
-      const res = await api.sendMessage(chatId, text);
+      const res = await api.sendMessage(chatId, text || " ", fileIds);
       const assistantMsg: Message = {
         id: "tmp-a-" + Date.now(), chat_id: chatId, role: "assistant",
         content: res.reply,
@@ -322,12 +381,38 @@ export default function App() {
         </div>
 
         <div className="input-bar">
+          {pendingFiles.length > 0 && (
+            <div className="pending-files">
+              {pendingFiles.map((f) => (
+                <span key={f.id} className="pending-chip">
+                  <span className="pending-chip-name">{f.original_name}</span>
+                  <button className="pending-chip-remove" onClick={() =>
+                    setPendingFiles((prev) => prev.filter((x) => x.id !== f.id))
+                  }>✕</button>
+                </span>
+              ))}
+            </div>
+          )}
           <div className="input-wrap">
+            <input ref={fileInputRef} type="file" multiple style={{ display: "none" }}
+              onChange={handleFileChange} />
+            <button className="btn-attach" onClick={() => fileInputRef.current?.click()}
+              disabled={sending || uploading} title="Attach file">
+              {uploading ? (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" style={{ opacity: 0.5 }}>
+                  <circle cx="12" cy="12" r="10" />
+                </svg>
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
+                </svg>
+              )}
+            </button>
             <textarea ref={textareaRef} className="input-text" value={input}
               onChange={handleInputChange} onKeyDown={handleKey}
               placeholder="Message…" rows={1} disabled={sending} />
             <button className="btn-send" onClick={handleSend}
-              disabled={!input.trim() || sending}>
+              disabled={(!input.trim() && pendingFiles.length === 0) || sending}>
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
                 <line x1="22" y1="2" x2="11" y2="13" />
                 <polygon points="22 2 15 22 11 13 2 9 22 2" />
